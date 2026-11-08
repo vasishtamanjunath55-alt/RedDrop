@@ -10,7 +10,15 @@ rmdir /s /q build_app\test
 xcopy /e /i /y lib build_app\lib
 copy /y pubspec.yaml build_app\pubspec.yaml
 
-powershell -Command "(Get-Content build_app\android\app\src\main\AndroidManifest.xml) -replace 'android:label=\"[^\"]*\"','android:label=\"RedDrop\"' | Set-Content build_app\android\app\src\main\AndroidManifest.xml"
+set MANIFEST=build_app\android\app\src\main\AndroidManifest.xml
+powershell -Command "$p='%MANIFEST%'; $t=Get-Content $p -Raw; $t=$t -replace 'android:label=\"[^\"]*\"','android:label=\"RedDrop\"'; $t=$t -replace '<application','<uses-permission android:name=\"android.permission.INTERNET\"/><application'; Set-Content $p $t"
+
+if exist build_app\android\app\build.gradle.kts (
+  powershell -Command "$p='build_app\android\app\build.gradle.kts'; (Get-Content $p -Raw) -replace 'minSdk = flutter.minSdkVersion','minSdk = 23' | Set-Content $p"
+)
+if exist build_app\android\app\build.gradle (
+  powershell -Command "$p='build_app\android\app\build.gradle'; (Get-Content $p -Raw) -replace 'minSdkVersion flutter.minSdkVersion','minSdkVersion 23' | Set-Content $p"
+)
 
 cd build_app
 call flutter pub get

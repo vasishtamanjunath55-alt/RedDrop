@@ -115,6 +115,25 @@ class HomeTab extends StatelessWidget {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
+        if (app.syncError != null) ...[
+          Card(
+            color: Colors.red.withAlpha(20),
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Row(
+                children: [
+                  const Icon(Icons.cloud_off, color: kRed),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(app.syncError!,
+                        style: const TextStyle(fontSize: 12)),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+        ],
         Container(
           padding: const EdgeInsets.all(18),
           decoration: BoxDecoration(

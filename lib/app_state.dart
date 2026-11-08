@@ -1,13 +1,14 @@
-import 'dart:convert';
-import 'dart:math';
+import 'dart:async';
 
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
 import 'models.dart';
 
-/// Single global app state. Data is stored on the device with
-/// shared_preferences, so the app works with no backend or internet.
+/// Single global app state. Firebase Auth handles accounts and Cloud Firestore
+/// is the shared, live database. Firestore listeners keep these lists up to
+/// date in real time, so every screen simply reads from here.
 final AppState app = AppState();
 
 class AppState extends ChangeNotifier {
@@ -16,13 +17,18 @@ class AppState extends ChangeNotifier {
   List<Donation> donations = [];
   List<Camp> camps = [];
   List<AppNotification> notifications = [];
+
   String? currentUserId;
+  bool booting = true;
+  bool usersLoaded = false;
+  bool profilePending = false;
+  String? syncError;
 
-  static const String _key = 'reddrop_data_v1';
-  final Random _rnd = Random();
+  StreamSubscription<User?>? _authSub;
+  final List<StreamSubscription<dynamic>> _subs = [];
 
-  String _id() =>
-      '${DateTime.now().microsecondsSinceEpoch}${_rnd.nextInt(9999)}';
+  FirebaseFirestore get _db => FirebaseFirestore.instance;
+  FirebaseAuth get _auth => FirebaseAuth.instance;
 
   // ---------------------------------------------------------------- lookups
 
@@ -43,72 +49,132 @@ class AppState extends ChangeNotifier {
     return null;
   }
 
-  // ------------------------------------------------------------ persistence
+  // ------------------------------------------------------------ live syncing
 
-  Future<void> load() async {
-    final p = await SharedPreferences.getInstance();
-    final raw = p.getString(_key);
-    if (raw == null) {
-      _seed();
-      await _save();
-    } else {
+  /// Call once after Firebase.initializeApp.
+  void init() {
+    _authSub = _auth.authStateChanges().listen((u) {
+      booting = false;
+      if (u == null) {
+        _stopListening();
+        currentUserId = null;
+      } else if (u.uid != currentUserId || _subs.isEmpty) {
+        currentUserId = u.uid;
+        _startListening(u.uid);
+      }
+      notifyListeners();
+    });
+  }
+
+  void _startListening(String uid) {
+    _stopListening();
+    usersLoaded = false;
+    _subs.add(_db.collection('users').snapshots().listen((s) {
+      users = _parse(s, AppUser.fromJson);
+      usersLoaded = true;
+      syncError = null;
+      notifyListeners();
+    }, onError: _onStreamError));
+    _subs.add(_db.collection('requests').snapshots().listen((s) {
+      requests = _parse(s, BloodRequest.fromJson);
+      syncError = null;
+      notifyListeners();
+    }, onError: _onStreamError));
+    _subs.add(_db.collection('donations').snapshots().listen((s) {
+      donations = _parse(s, Donation.fromJson);
+      notifyListeners();
+    }, onError: _onStreamError));
+    _subs.add(_db.collection('camps').snapshots().listen((s) {
+      camps = _parse(s, Camp.fromJson);
+      notifyListeners();
+    }, onError: _onStreamError));
+    _subs.add(_db
+        .collection('notifications')
+        .where('userId', isEqualTo: uid)
+        .snapshots()
+        .listen((s) {
+      notifications = _parse(s, AppNotification.fromJson);
+      notifyListeners();
+    }, onError: _onStreamError));
+  }
+
+  void _stopListening() {
+    for (final s in _subs) {
+      s.cancel();
+    }
+    _subs.clear();
+    users = [];
+    requests = [];
+    donations = [];
+    camps = [];
+    notifications = [];
+    usersLoaded = false;
+  }
+
+  List<T> _parse<T>(QuerySnapshot<Map<String, dynamic>> s,
+      T Function(Map<String, dynamic>) fromJson) {
+    final out = <T>[];
+    for (final d in s.docs) {
       try {
-        _fromJson(jsonDecode(raw) as Map<String, dynamic>);
+        out.add(fromJson(d.data()));
       } catch (_) {
-        _seed();
-        await _save();
+        // skip a malformed document instead of breaking the whole list
       }
     }
+    return out;
+  }
+
+  void _onStreamError(Object e) {
+    syncError = _errText(e);
     notifyListeners();
   }
 
-  Future<void> _save() async {
-    final p = await SharedPreferences.getInstance();
-    await p.setString(_key, jsonEncode(_toJson()));
+  String _errText(Object e) {
+    if (e is FirebaseException && e.code == 'permission-denied') {
+      return 'Permission denied by Firestore. Publish the rules from the README.';
+    }
+    final s = e.toString();
+    return s.length > 140 ? '${s.substring(0, 140)}...' : s;
   }
 
-  void _changed() {
-    _save();
-    notifyListeners();
-  }
-
-  Map<String, dynamic> _toJson() => {
-        'users': users.map((e) => e.toJson()).toList(),
-        'requests': requests.map((e) => e.toJson()).toList(),
-        'donations': donations.map((e) => e.toJson()).toList(),
-        'camps': camps.map((e) => e.toJson()).toList(),
-        'notifications': notifications.map((e) => e.toJson()).toList(),
-        'currentUserId': currentUserId,
-      };
-
-  void _fromJson(Map<String, dynamic> j) {
-    users = (j['users'] as List)
-        .map((e) => AppUser.fromJson(e as Map<String, dynamic>))
-        .toList();
-    requests = (j['requests'] as List)
-        .map((e) => BloodRequest.fromJson(e as Map<String, dynamic>))
-        .toList();
-    donations = (j['donations'] as List)
-        .map((e) => Donation.fromJson(e as Map<String, dynamic>))
-        .toList();
-    camps = (j['camps'] as List)
-        .map((e) => Camp.fromJson(e as Map<String, dynamic>))
-        .toList();
-    notifications = (j['notifications'] as List)
-        .map((e) => AppNotification.fromJson(e as Map<String, dynamic>))
-        .toList();
-    currentUserId = j['currentUserId'] as String?;
-  }
-
-  /// Wipes everything and restores the demo data.
-  void resetDemo() {
-    _seed();
-    _changed();
+  /// Runs a write without blocking the UI. The local cache updates at once and
+  /// Firestore syncs in the background (and queues the write while offline).
+  void _fire(Future<void> f) {
+    f.catchError((Object e) {
+      syncError = 'Could not save: ${_errText(e)}';
+      notifyListeners();
+    });
   }
 
   // ------------------------------------------------------------------- auth
 
-  String? register({
+  String _authMsg(FirebaseAuthException e) {
+    switch (e.code) {
+      case 'email-already-in-use':
+        return 'An account with this email already exists.';
+      case 'invalid-email':
+        return 'That email address is not valid.';
+      case 'weak-password':
+        return 'Password is too weak. Use at least 6 characters.';
+      case 'user-not-found':
+      case 'wrong-password':
+      case 'invalid-credential':
+      case 'invalid-login-credentials':
+        return 'Wrong email or password.';
+      case 'user-disabled':
+        return 'This account has been disabled.';
+      case 'network-request-failed':
+        return 'No internet connection.';
+      case 'operation-not-allowed':
+        return 'Email/password sign-in is not enabled in your Firebase project.';
+      case 'too-many-requests':
+        return 'Too many attempts. Try again in a few minutes.';
+      default:
+        return e.message ?? 'Sign in failed (${e.code}).';
+    }
+  }
+
+  Future<String?> register({
     required String name,
     required String email,
     required String password,
@@ -116,44 +182,58 @@ class AppState extends ChangeNotifier {
     required String city,
     required String bloodGroup,
     required String role,
-  }) {
-    final e = email.trim().toLowerCase();
-    if (users.any((u) => u.email == e)) {
-      return 'An account with this email already exists.';
+  }) async {
+    profilePending = true;
+    notifyListeners();
+    UserCredential? cred;
+    try {
+      cred = await _auth.createUserWithEmailAndPassword(
+        email: email.trim(),
+        password: password,
+      );
+      final u = AppUser(
+        id: cred.user!.uid,
+        name: name.trim(),
+        email: email.trim().toLowerCase(),
+        phone: phone.trim(),
+        city: city,
+        bloodGroup: bloodGroup,
+        role: role,
+      );
+      await _db.collection('users').doc(u.id).set(u.toJson());
+      profilePending = false;
+      notifyListeners();
+      return null;
+    } on FirebaseAuthException catch (e) {
+      profilePending = false;
+      notifyListeners();
+      return _authMsg(e);
+    } catch (e) {
+      // The account was created but the profile could not be saved.
+      try {
+        await cred?.user?.delete();
+      } catch (_) {}
+      profilePending = false;
+      notifyListeners();
+      return 'Could not save your profile. ${_errText(e)}';
     }
-    final u = AppUser(
-      id: _id(),
-      name: name.trim(),
-      email: e,
-      password: password,
-      phone: phone.trim(),
-      city: city,
-      bloodGroup: bloodGroup,
-      role: role,
-    );
-    users.add(u);
-    currentUserId = u.id;
-    _changed();
-    return null;
   }
 
-  String? login(String email, String password) {
-    final e = email.trim().toLowerCase();
-    for (final u in users) {
-      if (u.email == e) {
-        if (u.password != password) return 'Wrong password.';
-        currentUserId = u.id;
-        _changed();
-        return null;
-      }
+  Future<String?> login(String email, String password) async {
+    try {
+      await _auth.signInWithEmailAndPassword(
+        email: email.trim(),
+        password: password,
+      );
+      return null;
+    } on FirebaseAuthException catch (e) {
+      return _authMsg(e);
+    } catch (e) {
+      return 'Could not log in. Check your internet connection.';
     }
-    return 'No account found with this email.';
   }
 
-  void logout() {
-    currentUserId = null;
-    _changed();
-  }
+  Future<void> logout() => _auth.signOut();
 
   void updateProfile({
     required String name,
@@ -164,19 +244,19 @@ class AppState extends ChangeNotifier {
   }) {
     final m = me;
     if (m == null) return;
-    m.name = name.trim();
-    m.phone = phone.trim();
-    m.city = city;
-    m.bloodGroup = bloodGroup;
-    m.role = role;
-    _changed();
+    _fire(_db.collection('users').doc(m.id).update({
+      'name': name.trim(),
+      'phone': phone.trim(),
+      'city': city,
+      'bloodGroup': bloodGroup,
+      'role': role,
+    }));
   }
 
   void setAvailability(bool value) {
     final m = me;
     if (m == null) return;
-    m.available = value;
-    _changed();
+    _fire(_db.collection('users').doc(m.id).update({'available': value}));
   }
 
   // --------------------------------------------------------------- matching
@@ -238,7 +318,7 @@ class AppState extends ChangeNotifier {
 
   // --------------------------------------------------------------- requests
 
-  /// Creates a request and notifies matching donors. Returns how many.
+  /// Creates a request and alerts matching donors. Returns how many.
   int createRequest({
     required String patient,
     required String bloodGroup,
@@ -251,8 +331,9 @@ class AppState extends ChangeNotifier {
     String note = '',
   }) {
     final m = me!;
+    final ref = _db.collection('requests').doc();
     final r = BloodRequest(
-      id: _id(),
+      id: ref.id,
       requesterId: m.id,
       requesterName: m.name,
       patientName: patient.trim(),
@@ -267,27 +348,38 @@ class AppState extends ChangeNotifier {
       status: 'Open',
       createdAt: DateTime.now(),
     );
-    requests.insert(0, r);
     final donors = matchingDonors(r, onlyAvailable: true);
+    final batch = _db.batch();
+    batch.set(ref, r.toJson());
     for (final d in donors) {
-      _notify(
-        d.id,
-        '$urgency: $bloodGroup needed in $city',
-        '$units unit(s) at ${r.hospital}. You can help - tap to respond.',
-        requestId: r.id,
+      final nref = _db.collection('notifications').doc();
+      batch.set(
+        nref,
+        AppNotification(
+          id: nref.id,
+          userId: d.id,
+          title: '$urgency: $bloodGroup needed in $city',
+          body:
+              '$units unit(s) at ${r.hospital}. You can help - tap to respond.',
+          requestId: r.id,
+          time: DateTime.now(),
+        ).toJson(),
       );
     }
-    _changed();
+    _fire(batch.commit());
     return donors.length;
   }
 
   void respond(BloodRequest r, bool accept) {
     final m = me;
     if (m == null) return;
+    final ref = _db.collection('requests').doc(r.id);
     if (accept) {
-      if (!r.acceptedIds.contains(m.id)) r.acceptedIds.add(m.id);
-      r.declinedIds.remove(m.id);
-      if (r.status == 'Open') r.status = 'Donor found';
+      _fire(ref.update({
+        'acceptedIds': FieldValue.arrayUnion([m.id]),
+        'declinedIds': FieldValue.arrayRemove([m.id]),
+        if (r.status == 'Open') 'status': 'Donor found',
+      }));
       _notify(
         r.requesterId,
         '${m.name} accepted your request',
@@ -295,48 +387,60 @@ class AppState extends ChangeNotifier {
         requestId: r.id,
       );
     } else {
-      if (!r.declinedIds.contains(m.id)) r.declinedIds.add(m.id);
-      r.acceptedIds.remove(m.id);
-      if (r.acceptedIds.isEmpty && r.status == 'Donor found') {
-        r.status = 'Open';
-      }
+      final remaining = r.acceptedIds.where((id) => id != m.id).length;
+      _fire(ref.update({
+        'declinedIds': FieldValue.arrayUnion([m.id]),
+        'acceptedIds': FieldValue.arrayRemove([m.id]),
+        if (r.status == 'Donor found' && remaining == 0) 'status': 'Open',
+      }));
     }
-    _changed();
   }
 
   /// Marks the request fulfilled. If [donorId] is given, records a donation
   /// for that donor and starts their 90 day eligibility timer.
   void markFulfilled(BloodRequest r, {String? donorId}) {
-    r.status = 'Fulfilled';
-    r.fulfilledBy = donorId;
+    final batch = _db.batch();
+    batch.update(_db.collection('requests').doc(r.id), {
+      'status': 'Fulfilled',
+      'fulfilledBy': donorId,
+    });
     final d = userById(donorId);
     if (d != null) {
-      d.lastDonation = DateTime.now();
-      donations.insert(
-        0,
+      final now = DateTime.now();
+      final dref = _db.collection('donations').doc();
+      batch.set(
+        dref,
         Donation(
-          id: _id(),
+          id: dref.id,
           donorId: d.id,
-          date: DateTime.now(),
+          date: now,
           place: r.hospital,
           bloodGroup: d.bloodGroup,
           requestId: r.id,
-        ),
+        ).toJson(),
       );
-      _notify(
-        d.id,
-        'Thank you for donating!',
-        'Your donation at ${r.hospital} was recorded. You can donate again in $eligibilityDays days.',
-        requestId: r.id,
+      batch.update(_db.collection('users').doc(d.id), {
+        'lastDonation': now.toIso8601String(),
+      });
+      final nref = _db.collection('notifications').doc();
+      batch.set(
+        nref,
+        AppNotification(
+          id: nref.id,
+          userId: d.id,
+          title: 'Thank you for donating!',
+          body:
+              'Your donation at ${r.hospital} was recorded. You can donate again in $eligibilityDays days.',
+          requestId: r.id,
+          time: now,
+        ).toJson(),
       );
     }
-    _changed();
+    _fire(batch.commit());
   }
 
   void deleteRequest(String id) {
-    requests.removeWhere((r) => r.id == id);
-    notifications.removeWhere((n) => n.requestId == id);
-    _changed();
+    _fire(_db.collection('requests').doc(id).delete());
   }
 
   // -------------------------------------------------------------- donations
@@ -344,19 +448,25 @@ class AppState extends ChangeNotifier {
   void logDonation(DateTime date, String place) {
     final m = me;
     if (m == null) return;
-    donations.insert(
-      0,
+    final batch = _db.batch();
+    final dref = _db.collection('donations').doc();
+    batch.set(
+      dref,
       Donation(
-        id: _id(),
+        id: dref.id,
         donorId: m.id,
         date: date,
         place: place.isEmpty ? 'Blood donation' : place,
         bloodGroup: m.bloodGroup,
-      ),
+      ).toJson(),
     );
     final last = m.lastDonation;
-    if (last == null || date.isAfter(last)) m.lastDonation = date;
-    _changed();
+    if (last == null || date.isAfter(last)) {
+      batch.update(_db.collection('users').doc(m.id), {
+        'lastDonation': date.toIso8601String(),
+      });
+    }
+    _fire(batch.commit());
   }
 
   int donationCount(String userId) =>
@@ -373,89 +483,95 @@ class AppState extends ChangeNotifier {
   void toggleCamp(Camp c) {
     final m = me;
     if (m == null) return;
-    if (c.registeredIds.contains(m.id)) {
-      c.registeredIds.remove(m.id);
-    } else {
-      c.registeredIds.add(m.id);
-    }
-    _changed();
+    final joined = c.registeredIds.contains(m.id);
+    _fire(_db.collection('camps').doc(c.id).update({
+      'registeredIds': joined
+          ? FieldValue.arrayRemove([m.id])
+          : FieldValue.arrayUnion([m.id]),
+    }));
   }
 
   void addCamp(String title, String venue, String city, DateTime date,
       String organizer) {
-    camps.add(Camp(
-      id: _id(),
+    final ref = _db.collection('camps').doc();
+    _fire(ref.set(Camp(
+      id: ref.id,
       title: title.trim(),
       venue: venue.trim(),
       city: city,
       date: date,
       organizer: organizer.trim(),
-    ));
-    _changed();
+    ).toJson()));
   }
 
   void deleteCamp(String id) {
-    camps.removeWhere((c) => c.id == id);
-    _changed();
+    _fire(_db.collection('camps').doc(id).delete());
   }
 
   // ----------------------------------------------------------- notifications
 
   void _notify(String userId, String title, String body, {String? requestId}) {
-    notifications.insert(
-      0,
-      AppNotification(
-        id: _id(),
-        userId: userId,
-        title: title,
-        body: body,
-        requestId: requestId,
-        time: DateTime.now(),
-      ),
-    );
+    final ref = _db.collection('notifications').doc();
+    _fire(ref.set(AppNotification(
+      id: ref.id,
+      userId: userId,
+      title: title,
+      body: body,
+      requestId: requestId,
+      time: DateTime.now(),
+    ).toJson()));
   }
 
-  List<AppNotification> myNotifications() =>
-      notifications.where((n) => n.userId == currentUserId).toList();
+  List<AppNotification> myNotifications() {
+    final list =
+        notifications.where((n) => n.userId == currentUserId).toList();
+    list.sort((a, b) => b.time.compareTo(a.time));
+    return list;
+  }
 
   int get unreadCount => notifications
       .where((n) => n.userId == currentUserId && !n.read)
       .length;
 
   void markRead(AppNotification n) {
-    n.read = true;
-    _changed();
+    _fire(_db.collection('notifications').doc(n.id).update({'read': true}));
   }
 
   void markAllRead() {
+    final batch = _db.batch();
+    var any = false;
     for (final n in notifications) {
-      if (n.userId == currentUserId) n.read = true;
+      if (n.userId == currentUserId && !n.read) {
+        batch.update(_db.collection('notifications').doc(n.id), {'read': true});
+        any = true;
+      }
     }
-    _changed();
+    if (any) _fire(batch.commit());
   }
 
   // ------------------------------------------------------------------ admin
 
   void setVerified(String userId, bool value) {
-    final u = userById(userId);
-    if (u == null) return;
-    u.verified = value;
-    _changed();
+    _fire(_db.collection('users').doc(userId).update({'verified': value}));
   }
 
+  /// Removes the user's profile and their requests. (Their login account stays
+  /// in Firebase Auth; delete it in the Firebase console if needed.)
   void deleteUser(String userId) {
-    users.removeWhere((u) => u.id == userId);
-    requests.removeWhere((r) => r.requesterId == userId);
-    for (final r in requests) {
-      r.acceptedIds.remove(userId);
-      r.declinedIds.remove(userId);
+    _fire(_deleteUser(userId));
+  }
+
+  Future<void> _deleteUser(String userId) async {
+    final reqs = await _db
+        .collection('requests')
+        .where('requesterId', isEqualTo: userId)
+        .get();
+    final batch = _db.batch();
+    for (final d in reqs.docs) {
+      batch.delete(d.reference);
     }
-    donations.removeWhere((d) => d.donorId == userId);
-    notifications.removeWhere((n) => n.userId == userId);
-    for (final c in camps) {
-      c.registeredIds.remove(userId);
-    }
-    _changed();
+    batch.delete(_db.collection('users').doc(userId));
+    await batch.commit();
   }
 
   // ------------------------------------------------------------------ stats
@@ -491,233 +607,6 @@ class AppState extends ChangeNotifier {
       BadgeInfo('Legend', '10 donations', Icons.emoji_events, n >= 10),
       BadgeInfo('Verified', 'Admin verified', Icons.verified, u.verified),
       BadgeInfo('Camp Goer', 'Joined a camp', Icons.event_available, inCamp),
-    ];
-  }
-
-  // ------------------------------------------------------------------- seed
-
-  void _seed() {
-    final now = DateTime.now();
-    users = [];
-    requests = [];
-    donations = [];
-    camps = [];
-    notifications = [];
-    currentUserId = null;
-
-    void add(
-      String id,
-      String name,
-      String email,
-      String group,
-      String city,
-      String role, {
-      String password = 'demo123',
-      bool verified = true,
-      bool available = true,
-      int? lastDays,
-      int past = 0,
-    }) {
-      final phone =
-          '+91 00000 000${users.length.toString().padLeft(2, '0')}';
-      final u = AppUser(
-        id: id,
-        name: name,
-        email: email,
-        password: password,
-        phone: phone,
-        city: city,
-        bloodGroup: group,
-        role: role,
-        verified: verified,
-        available: available,
-      );
-      final base = lastDays ?? (past > 0 ? 200 : null);
-      if (base != null) {
-        u.lastDonation = now.subtract(Duration(days: base));
-        for (var i = 0; i < past; i++) {
-          donations.add(Donation(
-            id: '${id}_d$i',
-            donorId: id,
-            date: now.subtract(Duration(days: base + i * 110)),
-            place: 'City Blood Bank',
-            bloodGroup: group,
-          ));
-        }
-      }
-      users.add(u);
-    }
-
-    add('admin', 'RedDrop Admin', 'admin@reddrop.com', 'O+', 'Bengaluru',
-        'admin',
-        password: 'admin123');
-    add('demo', 'Demo User', 'demo@reddrop.com', 'B+', 'Bengaluru', 'both',
-        past: 2, lastDays: 130);
-    add('d1', 'Aarav Sharma', 'aarav@demo.com', 'O+', 'Bengaluru', 'donor',
-        past: 5, lastDays: 100);
-    add('d2', 'Priya Nair', 'priya@demo.com', 'A+', 'Bengaluru', 'donor',
-        past: 3, lastDays: 95);
-    add('d3', 'Rohan Gupta', 'rohan@demo.com', 'B+', 'Bengaluru', 'donor',
-        past: 1, lastDays: 200);
-    add('d4', 'Sneha Reddy', 'sneha@demo.com', 'O-', 'Bengaluru', 'donor',
-        past: 7, lastDays: 120);
-    add('d5', 'Karthik Iyer', 'karthik@demo.com', 'AB+', 'Bengaluru', 'donor',
-        verified: false);
-    add('d6', 'Meera Joshi', 'meera@demo.com', 'A-', 'Bengaluru', 'donor',
-        past: 2, lastDays: 20);
-    add('d7', 'Vikram Singh', 'vikram@demo.com', 'B-', 'Bengaluru', 'donor',
-        available: false);
-    add('d8', 'Ananya Das', 'ananya@demo.com', 'O+', 'Mumbai', 'donor',
-        past: 4, lastDays: 150);
-    add('d9', 'Imran Khan', 'imran@demo.com', 'A+', 'Mumbai', 'donor',
-        past: 2, lastDays: 180);
-    add('d10', 'Divya Menon', 'divya@demo.com', 'B+', 'Chennai', 'donor',
-        past: 1, lastDays: 110);
-    add('d11', 'Arjun Patel', 'arjun@demo.com', 'O+', 'Delhi', 'both',
-        past: 6, lastDays: 101);
-    add('d12', 'Fatima Sheikh', 'fatima@demo.com', 'AB-', 'Hyderabad', 'donor');
-    add('d13', 'Rahul Verma', 'rahul@demo.com', 'A+', 'Delhi', 'donor',
-        past: 3, lastDays: 140);
-    add('d14', 'Lakshmi Rao', 'lakshmi@demo.com', 'O-', 'Hyderabad', 'donor',
-        past: 8, lastDays: 99);
-    add('r1', 'Kavya Rao', 'kavya@demo.com', 'A+', 'Bengaluru', 'requester');
-    add('r2', 'Suresh Kumar', 'suresh@demo.com', 'B+', 'Bengaluru',
-        'requester');
-    add('r3', 'Neha Kapoor', 'neha@demo.com', 'A-', 'Mumbai', 'requester');
-
-    String phoneOf(String id) => userById(id)?.phone ?? '';
-
-    requests = [
-      BloodRequest(
-        id: 'q1',
-        requesterId: 'r2',
-        requesterName: 'Suresh Kumar',
-        patientName: 'Ramesh Kumar',
-        bloodGroup: 'B+',
-        units: 2,
-        hospital: 'Lifeline Hospital',
-        city: 'Bengaluru',
-        urgency: 'Critical',
-        deadline: now.add(const Duration(hours: 8)),
-        phone: phoneOf('r2'),
-        note: 'Surgery is scheduled this evening.',
-        status: 'Open',
-        createdAt: now.subtract(const Duration(minutes: 40)),
-      ),
-      BloodRequest(
-        id: 'q2',
-        requesterId: 'r1',
-        requesterName: 'Kavya Rao',
-        patientName: 'Lata Rao',
-        bloodGroup: 'A+',
-        units: 1,
-        hospital: 'Sunrise Medical Centre',
-        city: 'Bengaluru',
-        urgency: 'Urgent',
-        deadline: now.add(const Duration(days: 1)),
-        phone: phoneOf('r1'),
-        note: '',
-        status: 'Open',
-        createdAt: now.subtract(const Duration(hours: 3)),
-      ),
-      BloodRequest(
-        id: 'q3',
-        requesterId: 'r1',
-        requesterName: 'Kavya Rao',
-        patientName: 'Mohan Das',
-        bloodGroup: 'O-',
-        units: 2,
-        hospital: 'City General Hospital',
-        city: 'Bengaluru',
-        urgency: 'Urgent',
-        deadline: now.add(const Duration(hours: 20)),
-        phone: phoneOf('r1'),
-        note: 'Accident case, needs rare group.',
-        status: 'Donor found',
-        createdAt: now.subtract(const Duration(hours: 6)),
-        acceptedIds: ['d4'],
-      ),
-      BloodRequest(
-        id: 'q4',
-        requesterId: 'r3',
-        requesterName: 'Neha Kapoor',
-        patientName: 'Sunita Kapoor',
-        bloodGroup: 'A-',
-        units: 1,
-        hospital: 'Harbour View Hospital',
-        city: 'Mumbai',
-        urgency: 'Normal',
-        deadline: now.add(const Duration(days: 3)),
-        phone: phoneOf('r3'),
-        note: '',
-        status: 'Open',
-        createdAt: now.subtract(const Duration(hours: 12)),
-      ),
-      BloodRequest(
-        id: 'q5',
-        requesterId: 'r1',
-        requesterName: 'Kavya Rao',
-        patientName: 'Anil Rao',
-        bloodGroup: 'O+',
-        units: 1,
-        hospital: 'City General Hospital',
-        city: 'Bengaluru',
-        urgency: 'Normal',
-        deadline: now.subtract(const Duration(days: 9)),
-        phone: phoneOf('r1'),
-        note: '',
-        status: 'Fulfilled',
-        createdAt: now.subtract(const Duration(days: 10)),
-        acceptedIds: ['d1'],
-        fulfilledBy: 'd1',
-      ),
-    ];
-
-    notifications = [
-      AppNotification(
-        id: 'n1',
-        userId: 'demo',
-        title: 'Critical: B+ needed in Bengaluru',
-        body: '2 unit(s) at Lifeline Hospital. You can help - tap to respond.',
-        requestId: 'q1',
-        time: now.subtract(const Duration(minutes: 38)),
-      ),
-    ];
-
-    camps = [
-      Camp(
-        id: 'c1',
-        title: 'Campus Blood Donation Drive',
-        venue: 'University Auditorium',
-        city: 'Bengaluru',
-        date: now.add(const Duration(days: 4, hours: 3)),
-        organizer: 'Campus Health Club',
-        registeredIds: ['d1', 'd2'],
-      ),
-      Camp(
-        id: 'c2',
-        title: 'Community Blood Camp',
-        venue: 'Community Hall, Indiranagar',
-        city: 'Bengaluru',
-        date: now.add(const Duration(days: 9)),
-        organizer: 'City Blood Bank',
-      ),
-      Camp(
-        id: 'c3',
-        title: 'Mega Donation Day',
-        venue: 'Andheri Community Centre',
-        city: 'Mumbai',
-        date: now.add(const Duration(days: 6)),
-        organizer: 'Lions Youth Group',
-      ),
-      Camp(
-        id: 'c4',
-        title: 'Save A Life Camp',
-        venue: 'Civic Centre',
-        city: 'Delhi',
-        date: now.add(const Duration(days: 12)),
-        organizer: 'Hope Foundation',
-      ),
     ];
   }
 }

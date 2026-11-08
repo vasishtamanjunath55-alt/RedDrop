@@ -1,0 +1,59 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return signedIn() &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    // Profiles. Anyone signed in can read (donor search needs it).
+    // Nobody can make themselves admin or verified.
+    match /users/{uid} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.role in ['donor', 'requester', 'both']
+        && request.resource.data.verified == false;
+      allow update: if signedIn() && (
+        isAdmin()
+        || (request.auth.uid == uid
+            && request.resource.data.verified == resource.data.verified
+            && request.resource.data.role in ['donor', 'requester', 'both'])
+        // a requester marking a donation updates only the donor's lastDonation
+        || request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastDonation'])
+      );
+      allow delete: if isAdmin();
+    }
+
+    match /requests/{id} {
+      allow read: if signedIn();
+      allow create: if signedIn() && request.resource.data.requesterId == request.auth.uid;
+      allow update: if signedIn();
+      allow delete: if signedIn() && (resource.data.requesterId == request.auth.uid || isAdmin());
+    }
+
+    match /donations/{id} {
+      allow read: if signedIn();
+      allow create: if signedIn();
+      allow delete: if isAdmin();
+    }
+
+    match /camps/{id} {
+      allow read: if signedIn();
+      allow create, delete: if isAdmin();
+      allow update: if signedIn();
+    }
+
+    // Alerts: you can only read and change your own.
+    match /notifications/{id} {
+      allow read: if signedIn() && resource.data.userId == request.auth.uid;
+      allow create: if signedIn();
+      allow update, delete: if signedIn() && resource.data.userId == request.auth.uid;
+    }
+  }
+}

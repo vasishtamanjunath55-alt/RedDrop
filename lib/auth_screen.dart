@@ -19,6 +19,7 @@ class _AuthScreenState extends State<AuthScreen> {
   final _phone = TextEditingController();
   bool isLogin = true;
   bool hide = true;
+  bool busy = false;
   String city = cities.first;
   String group = 'O+';
   String role = 'both';
@@ -33,13 +34,17 @@ class _AuthScreenState extends State<AuthScreen> {
     super.dispose();
   }
 
-  void _submit() {
+  Future<void> _submit() async {
     if (!_form.currentState!.validate()) return;
+    setState(() {
+      busy = true;
+      error = null;
+    });
     final String? err;
     if (isLogin) {
-      err = app.login(_email.text, _password.text);
+      err = await app.login(_email.text, _password.text);
     } else {
-      err = app.register(
+      err = await app.register(
         name: _name.text,
         email: _email.text,
         password: _password.text,
@@ -49,12 +54,11 @@ class _AuthScreenState extends State<AuthScreen> {
         role: role,
       );
     }
-    if (err != null) setState(() => error = err);
-  }
-
-  void _demo(String email, String pass) {
-    final err = app.login(email, pass);
-    if (err != null) setState(() => error = err);
+    if (!mounted) return;
+    setState(() {
+      busy = false;
+      error = err;
+    });
   }
 
   @override
@@ -160,10 +164,10 @@ class _AuthScreenState extends State<AuthScreen> {
                             labelText: 'Phone number',
                             prefixIcon: Icon(Icons.phone),
                             border: OutlineInputBorder()),
-                        validator: (v) =>
-                            (v == null || v.replaceAll(RegExp(r'[^0-9]'), '').length < 10)
-                                ? 'Enter a 10 digit number'
-                                : null,
+                        validator: (v) => (v == null ||
+                                v.replaceAll(RegExp(r'[^0-9]'), '').length < 10)
+                            ? 'Enter a 10 digit number'
+                            : null,
                       ),
                       const SizedBox(height: 12),
                       Row(
@@ -206,37 +210,26 @@ class _AuthScreenState extends State<AuthScreen> {
                     ],
                     const SizedBox(height: 20),
                     FilledButton(
-                      onPressed: _submit,
+                      onPressed: busy ? null : _submit,
                       style: FilledButton.styleFrom(
                           backgroundColor: kRed,
                           padding: const EdgeInsets.symmetric(vertical: 14)),
-                      child: Text(isLogin ? 'Login' : 'Create account'),
+                      child: busy
+                          ? const SizedBox(
+                              width: 20,
+                              height: 20,
+                              child: CircularProgressIndicator(
+                                  strokeWidth: 2, color: Colors.white),
+                            )
+                          : Text(isLogin ? 'Login' : 'Create account'),
                     ),
-                    const SizedBox(height: 24),
-                    const Divider(),
-                    const Center(
-                        child: Text('Quick demo access',
-                            style: TextStyle(color: Colors.grey))),
-                    const SizedBox(height: 8),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: OutlinedButton.icon(
-                            onPressed: () => _demo('demo@reddrop.com', 'demo123'),
-                            icon: const Icon(Icons.person_outline),
-                            label: const Text('Demo user'),
-                          ),
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: OutlinedButton.icon(
-                            onPressed: () =>
-                                _demo('admin@reddrop.com', 'admin123'),
-                            icon: const Icon(Icons.admin_panel_settings_outlined),
-                            label: const Text('Admin'),
-                          ),
-                        ),
-                      ],
+                    const SizedBox(height: 16),
+                    Text(
+                      isLogin
+                          ? 'New here? Switch to Sign up to create your account.'
+                          : 'Your phone number is shown to people you are matched with.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: Colors.grey.shade600, fontSize: 12),
                     ),
                   ],
                 ),

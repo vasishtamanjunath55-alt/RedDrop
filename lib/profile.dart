@@ -219,16 +219,6 @@ class ProfileTab extends StatelessWidget {
           ),
         ],
         const SizedBox(height: 20),
-        OutlinedButton.icon(
-          onPressed: () async {
-            final ok = await confirm(context, 'Reset demo data?',
-                'This restores all sample donors, requests and camps and logs you out.');
-            if (ok) app.resetDemo();
-          },
-          icon: const Icon(Icons.restore),
-          label: const Text('Reset demo data'),
-        ),
-        const SizedBox(height: 8),
         FilledButton.icon(
           style: FilledButton.styleFrom(backgroundColor: kRed),
           onPressed: () => app.logout(),

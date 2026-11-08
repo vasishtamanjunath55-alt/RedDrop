@@ -45,7 +45,6 @@ class AppUser {
   String id;
   String name;
   String email;
-  String password;
   String phone;
   String city;
   String bloodGroup;
@@ -58,7 +57,6 @@ class AppUser {
     required this.id,
     required this.name,
     required this.email,
-    required this.password,
     required this.phone,
     required this.city,
     required this.bloodGroup,
@@ -88,7 +86,6 @@ class AppUser {
         'id': id,
         'name': name,
         'email': email,
-        'password': password,
         'phone': phone,
         'city': city,
         'bloodGroup': bloodGroup,
@@ -102,7 +99,6 @@ class AppUser {
         id: j['id'] as String,
         name: j['name'] as String,
         email: j['email'] as String,
-        password: j['password'] as String,
         phone: j['phone'] as String,
         city: j['city'] as String,
         bloodGroup: j['bloodGroup'] as String,
